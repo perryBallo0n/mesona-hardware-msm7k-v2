@@ -538,7 +538,7 @@ status_t AudioHardware::AudioStreamOutQ5V2::getRenderPosition(uint32_t *dspFrame
 // ----------------------------------------------------------------------------
 
 AudioHardware::AudioStreamInQ5V2::AudioStreamInQ5V2() :
-    mHardware(0), mFd(-1), mStandby(true), mStarted(false), mRetryCount(0),
+    mHardware(0), mFd(-1), mStandby(true), mStarted(false), mRouted(false), mRetryCount(0),
     mDevices(0), mChannels(AUDIO_HW_IN_CHANNELS),
     mSampleRate(AUDIO_HW_IN_SAMPLERATE), mBufferSize(AUDIO_HW_IN_BUFSZ),
     mAcoustics((AudioSystem::audio_in_acoustics)0)
@@ -571,8 +571,9 @@ status_t AudioHardware::AudioStreamInQ5V2::set(
         if (pChannels) *pChannels = AUDIO_HW_IN_CHANNELS;
         return BAD_VALUE;
     }
-    if (!is_valid_in_sample_rate(lRate)) {
-        if (pRate) *pRate = AUDIO_HW_IN_SAMPLERATE;
+    uint32_t targetRate = (hw && hw->mCachedInFd >= 0) ? hw->mCachedInRate : 16000;
+    if (lRate != targetRate) {
+        if (pRate) *pRate = targetRate;
         return BAD_VALUE;
     }
 
@@ -587,6 +588,12 @@ status_t AudioHardware::AudioStreamInQ5V2::set(
     mAcoustics = acoustics;
     mBufferSize = AUDIO_HW_IN_BUFSZ;
 
+    /* Pre-open & pre-route capture driver before AudioSource::read captures initial timestamp. */
+    status_t rc = openDriver();
+    if (rc != NO_ERROR) {
+        return rc;
+    }
+
     return NO_ERROR;
 }
 
@@ -598,6 +605,8 @@ status_t AudioHardware::AudioStreamInQ5V2::openDriver()
     if (mHardware && mHardware->mCachedInFd >= 0) {
         if (mHardware->mCachedInRate == mSampleRate && mHardware->mCachedInCh == mChannels) {
             mFd = mHardware->mCachedInFd;
+            do_route_audio_rpc(get_in_snd_device(mDevices), 0, mHardware->mMicMute ? 1 : 0);
+            mRouted = true;
             mStandby = false;
             mStarted = false;
             LOGI("AudioStreamInQ5V2: reusing cached /dev/snd/pcmC0D0c fd=%d rate=%u", mFd, mSampleRate);
@@ -661,6 +670,8 @@ status_t AudioHardware::AudioStreamInQ5V2::openDriver()
         mHardware->mCachedInRate = mSampleRate;
         mHardware->mCachedInCh = mChannels;
     }
+    do_route_audio_rpc(get_in_snd_device(mDevices), 0, mHardware && mHardware->mMicMute ? 1 : 0);
+    mRouted = true;
     mStandby = false;
     mStarted = false;
     LOGI("AudioStreamInQ5V2: opened /dev/snd/pcmC0D0c rate=%u ch=%u buf=%zu dev=0x%x",
@@ -680,7 +691,10 @@ ssize_t AudioHardware::AudioStreamInQ5V2::read(void* buffer, ssize_t bytes)
     }
     if (!mStarted) {
         uint32_t snd_dev = get_in_snd_device(mDevices);
-        do_route_audio_rpc(snd_dev, 0, mHardware->mMicMute ? 1 : 0);
+        if (!mRouted) {
+            do_route_audio_rpc(snd_dev, 0, mHardware->mMicMute ? 1 : 0);
+            mRouted = true;
+        }
         if (ioctl(mFd, SNDRV_PCM_IOCTL_PREPARE, 0) < 0) {
             LOGE("pcmC0D0c SNDRV_PCM_IOCTL_PREPARE failed errno=%d", errno);
             standby();
@@ -729,6 +743,7 @@ status_t AudioHardware::AudioStreamInQ5V2::standby()
         mFd = -1;
     }
     mStarted = false;
+    mRouted = false;
     mStandby = true;
     return NO_ERROR;
 }

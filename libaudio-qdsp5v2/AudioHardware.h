@@ -123,6 +123,7 @@ private:
                 int         mStartCount;
                 int         mRetryCount;
                 bool        mStandby;
+                bool        mRouted;
                 uint32_t    mDevices;
                 uint32_t    mChannels;
                 uint32_t    mSampleRate;
@@ -158,6 +159,7 @@ private:
                 int         mFd;
                 bool        mStandby;
                 bool        mStarted;
+                bool        mRouted;
                 int         mRetryCount;
                 uint32_t    mDevices;
                 uint32_t    mChannels;
