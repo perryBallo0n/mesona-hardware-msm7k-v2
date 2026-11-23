@@ -37,6 +37,79 @@ extern "C" {
 #include "msm_audio.h"
 }
 
+#define __force
+#define __bitwise
+#define __user
+#include "asound.h"
+
+static inline int alsa_param_is_mask(int p)
+{
+    return (p >= SNDRV_PCM_HW_PARAM_FIRST_MASK) &&
+           (p <= SNDRV_PCM_HW_PARAM_LAST_MASK);
+}
+
+static inline int alsa_param_is_interval(int p)
+{
+    return (p >= SNDRV_PCM_HW_PARAM_FIRST_INTERVAL) &&
+           (p <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL);
+}
+
+static inline struct snd_interval *alsa_param_to_interval(struct snd_pcm_hw_params *p, int n)
+{
+    return &(p->intervals[n - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL]);
+}
+
+static inline struct snd_mask *alsa_param_to_mask(struct snd_pcm_hw_params *p, int n)
+{
+    return &(p->masks[n - SNDRV_PCM_HW_PARAM_FIRST_MASK]);
+}
+
+static void alsa_param_set_mask(struct snd_pcm_hw_params *p, int n, unsigned bit)
+{
+    if (bit >= SNDRV_MASK_MAX) return;
+    if (alsa_param_is_mask(n)) {
+        struct snd_mask *m = alsa_param_to_mask(p, n);
+        m->bits[0] = 0;
+        m->bits[1] = 0;
+        m->bits[bit >> 5] |= (1 << (bit & 31));
+    }
+}
+
+static void alsa_param_set_min(struct snd_pcm_hw_params *p, int n, unsigned val)
+{
+    if (alsa_param_is_interval(n)) {
+        struct snd_interval *i = alsa_param_to_interval(p, n);
+        i->min = val;
+    }
+}
+
+static void alsa_param_set_int(struct snd_pcm_hw_params *p, int n, unsigned val)
+{
+    if (alsa_param_is_interval(n)) {
+        struct snd_interval *i = alsa_param_to_interval(p, n);
+        i->min = val;
+        i->max = val;
+        i->integer = 1;
+    }
+}
+
+static void alsa_param_init(struct snd_pcm_hw_params *p)
+{
+    int n;
+    memset(p, 0, sizeof(*p));
+    for (n = SNDRV_PCM_HW_PARAM_FIRST_MASK; n <= SNDRV_PCM_HW_PARAM_LAST_MASK; n++) {
+        struct snd_mask *m = alsa_param_to_mask(p, n);
+        m->bits[0] = ~0;
+        m->bits[1] = ~0;
+    }
+    for (n = SNDRV_PCM_HW_PARAM_FIRST_INTERVAL; n <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL; n++) {
+        struct snd_interval *i = alsa_param_to_interval(p, n);
+        i->min = 0;
+        i->max = ~0;
+    }
+}
+
+
 #define SND_IOCTL_MAGIC 's'
 #define SND_SET_DEVICE _IOW(SND_IOCTL_MAGIC, 2, struct msm_snd_device_config *)
 #define SND_SET_VOLUME _IOW(SND_IOCTL_MAGIC, 3, struct msm_snd_volume_config *)
@@ -77,6 +150,37 @@ static uint32_t get_snd_device(uint32_t devices)
     return SND_DEVICE_SPEAKER;
 }
 
+
+static uint32_t get_in_snd_device(uint32_t devices)
+{
+    if (devices & AudioSystem::DEVICE_IN_WIRED_HEADSET) {
+        return SND_DEVICE_HEADSET;
+    } else if (devices & AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET) {
+        return SND_DEVICE_BT;
+    } else if (devices & AudioSystem::DEVICE_IN_BACK_MIC) {
+        return SND_DEVICE_SPEAKER;
+    }
+    return SND_DEVICE_HANDSET;
+}
+
+static bool is_valid_in_sample_rate(uint32_t rate)
+{
+    switch (rate) {
+    case 8000:
+    case 11025:
+    case 12000:
+    case 16000:
+    case 22050:
+    case 24000:
+    case 32000:
+    case 44100:
+    case 48000:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static int do_route_audio_rpc(uint32_t device, int ear_mute, int mic_mute)
 {
     int fd = open("/dev/msm_snd", O_RDWR);
@@ -106,7 +210,7 @@ static int do_route_audio_rpc(uint32_t device, int ear_mute, int mic_mute)
 // ----------------------------------------------------------------------------
 
 AudioHardware::AudioHardware() :
-    mInit(false), mMicMute(true), mOutput(0)
+    mInit(false), mMicMute(false), mOutput(0), mInput(0), mCachedInFd(-1), mCachedInRate(0), mCachedInCh(0)
 {
     mInit = true;
 }
@@ -114,6 +218,8 @@ AudioHardware::AudioHardware() :
 AudioHardware::~AudioHardware()
 {
     closeOutputStream((AudioStreamOut*)mOutput);
+    closeInputStream((AudioStreamIn*)mInput);
+    if (mCachedInFd >= 0) { ::close(mCachedInFd); mCachedInFd = -1; }
     mInit = false;
 }
 
@@ -166,10 +272,35 @@ AudioStreamIn* AudioHardware::openInputStream(
         uint32_t devices, int *format, uint32_t *channels, uint32_t *sampleRate, status_t *status,
         AudioSystem::audio_in_acoustics acoustic_flags)
 {
-    return 0;
+    Mutex::Autolock lock(mLock);
+    if (!AudioSystem::isInputDevice((AudioSystem::audio_devices)devices)) {
+        if (status) *status = BAD_VALUE;
+        return 0;
+    }
+    if (mInput) {
+        if (status) *status = INVALID_OPERATION;
+        return 0;
+    }
+    AudioStreamInQ5V2* in = new AudioStreamInQ5V2();
+    status_t rc = in->set(this, devices, format, channels, sampleRate, acoustic_flags);
+    if (status) *status = rc;
+    if (rc == NO_ERROR) {
+        mInput = in;
+    } else {
+        delete in;
+        in = 0;
+    }
+    return mInput;
 }
 
 void AudioHardware::closeInputStream(AudioStreamIn* in) {
+    Mutex::Autolock lock(mLock);
+    if (mInput == 0 || mInput != in) {
+        LOGW("Attempt to close invalid input stream");
+    } else {
+        delete mInput;
+        mInput = 0;
+    }
 }
 
 status_t AudioHardware::setMode(int mode)
@@ -179,6 +310,7 @@ status_t AudioHardware::setMode(int mode)
 
 status_t AudioHardware::setMicMute(bool state)
 {
+    mMicMute = state;
     return NO_ERROR;
 }
 
@@ -205,7 +337,10 @@ String8 AudioHardware::getParameters(const String8& keys)
 
 size_t AudioHardware::getInputBufferSize(uint32_t sampleRate, int format, int channelCount)
 {
-    return 4096;
+    if (format != AUDIO_HW_IN_FORMAT) return 0;
+    if (channelCount != 1 && channelCount != 2) return 0;
+    if (!is_valid_in_sample_rate(sampleRate)) return 0;
+    return AUDIO_HW_IN_BUFSZ;
 }
 
 status_t AudioHardware::setVoiceVolume(float v)
@@ -397,6 +532,231 @@ String8 AudioHardware::AudioStreamOutQ5V2::getParameters(const String8& keys)
 status_t AudioHardware::AudioStreamOutQ5V2::getRenderPosition(uint32_t *dspFrames)
 {
     return INVALID_OPERATION;
+}
+
+
+// ----------------------------------------------------------------------------
+
+AudioHardware::AudioStreamInQ5V2::AudioStreamInQ5V2() :
+    mHardware(0), mFd(-1), mStandby(true), mStarted(false), mRetryCount(0),
+    mDevices(0), mChannels(AUDIO_HW_IN_CHANNELS),
+    mSampleRate(AUDIO_HW_IN_SAMPLERATE), mBufferSize(AUDIO_HW_IN_BUFSZ),
+    mAcoustics((AudioSystem::audio_in_acoustics)0)
+{
+}
+
+AudioHardware::AudioStreamInQ5V2::~AudioStreamInQ5V2()
+{
+    standby();
+}
+
+status_t AudioHardware::AudioStreamInQ5V2::set(
+        AudioHardware* hw, uint32_t devices, int *pFormat, uint32_t *pChannels, uint32_t *pRate,
+        AudioSystem::audio_in_acoustics acoustics)
+{
+    int lFormat = pFormat ? *pFormat : 0;
+    uint32_t lChannels = pChannels ? *pChannels : 0;
+    uint32_t lRate = pRate ? *pRate : 0;
+
+    if (lFormat == 0) lFormat = AUDIO_HW_IN_FORMAT;
+    if (lChannels == 0) lChannels = AUDIO_HW_IN_CHANNELS;
+    if (lRate == 0) lRate = AUDIO_HW_IN_SAMPLERATE;
+
+    if (lFormat != AUDIO_HW_IN_FORMAT) {
+        if (pFormat) *pFormat = AUDIO_HW_IN_FORMAT;
+        return BAD_VALUE;
+    }
+    if (lChannels != AudioSystem::CHANNEL_IN_MONO &&
+        lChannels != AudioSystem::CHANNEL_IN_STEREO) {
+        if (pChannels) *pChannels = AUDIO_HW_IN_CHANNELS;
+        return BAD_VALUE;
+    }
+    if (!is_valid_in_sample_rate(lRate)) {
+        if (pRate) *pRate = AUDIO_HW_IN_SAMPLERATE;
+        return BAD_VALUE;
+    }
+
+    if (pFormat) *pFormat = lFormat;
+    if (pChannels) *pChannels = lChannels;
+    if (pRate) *pRate = lRate;
+
+    mHardware = hw;
+    mDevices = devices;
+    mChannels = lChannels;
+    mSampleRate = lRate;
+    mAcoustics = acoustics;
+    mBufferSize = AUDIO_HW_IN_BUFSZ;
+
+    return NO_ERROR;
+}
+
+status_t AudioHardware::AudioStreamInQ5V2::openDriver()
+{
+    if (mFd >= 0) {
+        return NO_ERROR;
+    }
+    if (mHardware && mHardware->mCachedInFd >= 0) {
+        if (mHardware->mCachedInRate == mSampleRate && mHardware->mCachedInCh == mChannels) {
+            mFd = mHardware->mCachedInFd;
+            mStandby = false;
+            mStarted = false;
+            LOGI("AudioStreamInQ5V2: reusing cached /dev/snd/pcmC0D0c fd=%d rate=%u", mFd, mSampleRate);
+            return NO_ERROR;
+        }
+        ::close(mHardware->mCachedInFd);
+        mHardware->mCachedInFd = -1;
+    }
+    int fd = ::open("/dev/snd/pcmC0D0c", O_RDWR);
+    if (fd < 0) {
+        LOGE("Cannot open /dev/snd/pcmC0D0c errno: %d", errno);
+        return -errno;
+    }
+
+    uint32_t ch = AudioSystem::popCount(mChannels);
+    uint32_t frame_bytes = ch * 2;
+    uint32_t period_frames = AUDIO_HW_IN_BUFSZ / frame_bytes;
+    uint32_t periods = 4;
+
+    struct snd_pcm_hw_params params;
+    alsa_param_init(&params);
+    alsa_param_set_mask(&params, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+    alsa_param_set_mask(&params, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+    alsa_param_set_mask(&params, SNDRV_PCM_HW_PARAM_SUBFORMAT, SNDRV_PCM_SUBFORMAT_STD);
+    alsa_param_set_int(&params, SNDRV_PCM_HW_PARAM_SAMPLE_BITS, 16);
+    alsa_param_set_int(&params, SNDRV_PCM_HW_PARAM_FRAME_BITS, ch * 16);
+    alsa_param_set_int(&params, SNDRV_PCM_HW_PARAM_CHANNELS, ch);
+    alsa_param_set_int(&params, SNDRV_PCM_HW_PARAM_RATE, mSampleRate);
+    alsa_param_set_min(&params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, period_frames);
+    alsa_param_set_int(&params, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, AUDIO_HW_IN_BUFSZ);
+    alsa_param_set_int(&params, SNDRV_PCM_HW_PARAM_PERIODS, periods);
+
+    if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &params) < 0) {
+        LOGE("pcmC0D0c SNDRV_PCM_IOCTL_HW_PARAMS failed (ch=%u rate=%u): errno=%d",
+             ch, mSampleRate, errno);
+        ::close(fd);
+        return -errno;
+    }
+
+    struct snd_pcm_sw_params sparams;
+    memset(&sparams, 0, sizeof(sparams));
+    sparams.tstamp_mode = SNDRV_PCM_TSTAMP_NONE;
+    sparams.period_step = 1;
+    sparams.avail_min = 1;
+    sparams.start_threshold = periods * period_frames;
+    sparams.stop_threshold = periods * period_frames;
+    sparams.xfer_align = period_frames / 2;
+    sparams.silence_size = 0;
+    sparams.silence_threshold = 0;
+
+    if (ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sparams) < 0) {
+        LOGE("pcmC0D0c SNDRV_PCM_IOCTL_SW_PARAMS failed: errno=%d", errno);
+        ::close(fd);
+        return -errno;
+    }
+
+    mBufferSize = AUDIO_HW_IN_BUFSZ;
+    mFd = fd;
+    if (mHardware) {
+        mHardware->mCachedInFd = fd;
+        mHardware->mCachedInRate = mSampleRate;
+        mHardware->mCachedInCh = mChannels;
+    }
+    mStandby = false;
+    mStarted = false;
+    LOGI("AudioStreamInQ5V2: opened /dev/snd/pcmC0D0c rate=%u ch=%u buf=%zu dev=0x%x",
+         mSampleRate, ch, mBufferSize, mDevices);
+    return NO_ERROR;
+}
+
+ssize_t AudioHardware::AudioStreamInQ5V2::read(void* buffer, ssize_t bytes)
+{
+    if (!mHardware || bytes <= 0) return -1;
+    if (mStandby || mFd < 0) {
+        status_t rc = openDriver();
+        if (rc != NO_ERROR) {
+            usleep(bytes * 1000000 / frameSize() / sampleRate());
+            return rc;
+        }
+    }
+    if (!mStarted) {
+        uint32_t snd_dev = get_in_snd_device(mDevices);
+        do_route_audio_rpc(snd_dev, 0, mHardware->mMicMute ? 1 : 0);
+        if (ioctl(mFd, SNDRV_PCM_IOCTL_PREPARE, 0) < 0) {
+            LOGE("pcmC0D0c SNDRV_PCM_IOCTL_PREPARE failed errno=%d", errno);
+            standby();
+            return -1;
+        }
+        if (ioctl(mFd, SNDRV_PCM_IOCTL_START, 0) < 0) {
+            LOGE("pcmC0D0c SNDRV_PCM_IOCTL_START failed errno=%d", errno);
+            standby();
+            return -1;
+        }
+        LOGI("AudioStreamInQ5V2: ALSA capture started (snd_dev=%u, rate=%u)", snd_dev, mSampleRate);
+        mStarted = true;
+    }
+
+    uint32_t frame_bytes = frameSize();
+    uint32_t frames = (uint32_t)bytes / frame_bytes;
+    struct snd_xferi x;
+    x.buf = buffer;
+    x.frames = frames;
+    x.result = 0;
+
+    for (int retries = 0; retries < 3; retries++) {
+        if (ioctl(mFd, SNDRV_PCM_IOCTL_READI_FRAMES, &x) == 0) {
+            return (ssize_t)(frames * frame_bytes);
+        }
+        if (errno == EPIPE) {
+            LOGW("pcmC0D0c overrun (EPIPE), re-preparing");
+            ioctl(mFd, SNDRV_PCM_IOCTL_PREPARE, 0);
+            ioctl(mFd, SNDRV_PCM_IOCTL_START, 0);
+            continue;
+        }
+        LOGE("pcmC0D0c SNDRV_PCM_IOCTL_READI_FRAMES failed errno=%d", errno);
+        return -errno;
+    }
+    return -1;
+}
+
+status_t AudioHardware::AudioStreamInQ5V2::standby()
+{
+    if (mFd >= 0) {
+        /* Keep /dev/snd/pcmC0D0c open across recordings because kernel msm_pcm_capture_close()
+         * leaves QDSP5 AUDRECTASK in a wedged state on reopen. */
+        if (!mHardware || mHardware->mCachedInFd != mFd) {
+            ::close(mFd);
+        }
+        mFd = -1;
+    }
+    mStarted = false;
+    mStandby = true;
+    return NO_ERROR;
+}
+
+status_t AudioHardware::AudioStreamInQ5V2::dump(int fd, const Vector<String16>& args)
+{
+    return NO_ERROR;
+}
+
+status_t AudioHardware::AudioStreamInQ5V2::setParameters(const String8& keyValuePairs)
+{
+    AudioParameter param = AudioParameter(keyValuePairs);
+    int value;
+    if (param.getInt(String8(AudioParameter::keyRouting), value) == NO_ERROR) {
+        if (value != 0) {
+            mDevices = (uint32_t)value;
+            if (!mStandby) {
+                do_route_audio_rpc(get_in_snd_device(mDevices), 0, mHardware->mMicMute ? 1 : 0);
+            }
+        }
+    }
+    return NO_ERROR;
+}
+
+String8 AudioHardware::AudioStreamInQ5V2::getParameters(const String8& keys)
+{
+    AudioParameter param = AudioParameter(keys);
+    return param.toString();
 }
 
 extern "C" AudioHardwareInterface* createAudioHardware(void) {

@@ -38,18 +38,15 @@ namespace android {
 #define AUDIO_HW_OUT_FORMAT (AudioSystem::PCM_16_BIT)  // Default audio output sample format
 #define AUDIO_HW_OUT_BUFSZ 4096  // Default audio output buffer size
 
-#if 0
 #define AUDIO_HW_IN_SAMPLERATE 8000                 // Default audio input sample rate
 #define AUDIO_HW_IN_CHANNELS (AudioSystem::CHANNEL_IN_MONO) // Default audio input channel mask
 #define AUDIO_HW_IN_FORMAT (AudioSystem::PCM_16_BIT)  // Default audio input sample format
-#define AUDIO_HW_IN_BUFSZ 256  // Default audio input buffer size
-
-#define VOICE_VOLUME_MAX 5  // Maximum voice volume
-#endif
+#define AUDIO_HW_IN_BUFSZ 4096  // Default audio input buffer size (MONO_DATA_SIZE)
 
 class AudioHardware : public  AudioHardwareBase
 {
     class AudioStreamOutQ5V2;
+    class AudioStreamInQ5V2;
 
 public:
                         AudioHardware();
@@ -61,6 +58,7 @@ public:
 
     virtual status_t    setMode(int mode);
 
+    // mic mute
     virtual status_t    setMicMute(bool state);
     virtual status_t    getMicMute(bool* state);
 
@@ -131,10 +129,51 @@ private:
                 size_t      mBufferSize;
     };
 
+    class AudioStreamInQ5V2 : public AudioStreamIn {
+    public:
+                            AudioStreamInQ5V2();
+        virtual             ~AudioStreamInQ5V2();
+                status_t    set(AudioHardware* mHardware,
+                                uint32_t devices,
+                                int *pFormat,
+                                uint32_t *pChannels,
+                                uint32_t *pRate,
+                                AudioSystem::audio_in_acoustics acoustics);
+        virtual uint32_t    sampleRate() const { return mSampleRate; }
+        virtual size_t      bufferSize() const { return mBufferSize; }
+        virtual uint32_t    channels() const { return mChannels; }
+        virtual int         format() const { return AUDIO_HW_IN_FORMAT; }
+        virtual status_t    setGain(float gain) { return INVALID_OPERATION; }
+        virtual ssize_t     read(void* buffer, ssize_t bytes);
+        virtual status_t    dump(int fd, const Vector<String16>& args);
+        virtual status_t    standby();
+        virtual status_t    setParameters(const String8& keyValuePairs);
+        virtual String8     getParameters(const String8& keys);
+        virtual unsigned int getInputFramesLost() const { return 0; }
+                uint32_t    devices() { return mDevices; }
+
+    private:
+                status_t    openDriver();
+                AudioHardware* mHardware;
+                int         mFd;
+                bool        mStandby;
+                bool        mStarted;
+                int         mRetryCount;
+                uint32_t    mDevices;
+                uint32_t    mChannels;
+                uint32_t    mSampleRate;
+                size_t      mBufferSize;
+                AudioSystem::audio_in_acoustics mAcoustics;
+    };
+
             bool        mInit;
             bool        mMicMute;
 
             AudioStreamOutQ5V2*  mOutput;
+            AudioStreamInQ5V2*   mInput;
+            int                  mCachedInFd;
+            uint32_t             mCachedInRate;
+            uint32_t             mCachedInCh;
             Mutex       mLock;
 };
 
