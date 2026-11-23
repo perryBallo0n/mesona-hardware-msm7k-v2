@@ -279,14 +279,28 @@ int gralloc_unlock(gralloc_module_t const* module,
     int32_t current_value, new_value;
 
     if (hnd->flags & private_handle_t::PRIV_FLAGS_NEEDS_FLUSH) {
-        struct pmem_region region;
-        int err;
-
-        region.offset = hnd->offset;
-        region.len = hnd->size;
-        err = ioctl(hnd->fd, PMEM_CACHE_FLUSH, &region);
-        LOGE_IF(err < 0, "cannot flush handle %p (offs=%x len=%x)\n",
-                hnd, hnd->offset, hnd->size);
+        int err = -1;
+        if (hnd->base != 0) {
+            struct {
+                unsigned long vaddr;
+                unsigned long offset;
+                unsigned long length;
+            } pmem_addr = {
+                (unsigned long)hnd->base,
+                (unsigned long)hnd->offset,
+                (unsigned long)hnd->size
+            };
+            err = ioctl(hnd->fd, _IOW('p', 11, unsigned int) /* PMEM_CLEAN_INV_CACHES */, &pmem_addr);
+        }
+        if (err < 0) {
+            struct pmem_region region;
+            region.offset = hnd->offset;
+            region.len = hnd->size;
+            err = ioctl(hnd->fd, PMEM_CACHE_FLUSH, &region);
+        }
+        LOGW_IF(err < 0 && errno != EINVAL && errno != ENOTTY,
+                "cannot flush handle %p (offs=%x len=%x errno=%d)\n",
+                hnd, hnd->offset, hnd->size, errno);
         hnd->flags &= ~private_handle_t::PRIV_FLAGS_NEEDS_FLUSH;
     }
 
