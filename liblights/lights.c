@@ -22,6 +22,7 @@
 #include <cutils/properties.h>
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -209,42 +210,67 @@ static void write_fih_led(int id, int val)
 }
 
 static void
-write_fih_sub_led(int id, int pwm, int fade, int on)
-{
-    int fd = open("/sys/class/led/fih_led/control", O_WRONLY);
-    if (fd >= 0) {
-        char buf[96];
-        int len;
-        if (!on || pwm <= 0) {
-            len = snprintf(buf, sizeof(buf), "3 %d 0\n1 %d 0\n", id, id);
-        } else if (fade) {
-            len = snprintf(buf, sizeof(buf), "1 %d 0\n25 %d %d\n6 %d 3\n3 %d 1\n",
-                           id, id, pwm, id, id);
-        } else {
-            len = snprintf(buf, sizeof(buf), "3 %d 0\n4 %d %d\n1 %d 1\n",
-                           id, id, pwm, id);
-        }
-        write(fd, buf, len);
-        close(fd);
-    }
-}
-
-static void
-write_fih_sub_bar(int red, int green, int blue, int scale_max, int fade)
+write_fih_sub_bar(int red, int green, int blue, int scale_max, int fade, int interval_ms)
 {
     char busy[PROPERTY_VALUE_MAX] = {0};
     property_get("sys.fih_led.busy", busy, "0");
     if (busy[0] == '1')
         return;
-    int r_pwm = (red > 0)   ? ((red   * scale_max) / 255) : 0;
-    int g_pwm = (green > 0) ? ((green * scale_max) / 255) : 0;
-    int b_pwm = (blue > 0)  ? ((blue  * scale_max) / 255) : 0;
-    if (red > 0 && r_pwm < 12)   r_pwm = 12;
-    if (green > 0 && g_pwm < 12) g_pwm = 12;
-    if (blue > 0 && b_pwm < 12)  b_pwm = 12;
-    write_fih_sub_led(4, r_pwm, fade && r_pwm > 0, r_pwm > 0);
-    write_fih_sub_led(5, g_pwm, fade && g_pwm > 0, g_pwm > 0);
-    write_fih_sub_led(6, b_pwm, fade && b_pwm > 0, b_pwm > 0);
+
+    int pwms[3];
+    int raw[3] = { red, green, blue };
+    int i;
+    int any_lit = 0;
+
+    if (interval_ms < 10) interval_ms = 10;
+    for (i = 0; i < 3; i++) {
+        if (raw[i] > 0 && scale_max > 0) {
+            int p = (raw[i] * scale_max + 127) / 255;
+            if (p < 12) p = 12;
+            if (p > 235) p = 235;
+            pwms[i] = p;
+            any_lit = 1;
+        } else {
+            pwms[i] = 0;
+        }
+    }
+
+    int fd = open("/sys/class/led/fih_led/control", O_WRONLY);
+    if (fd >= 0) {
+        char buf[384];
+        int len = 0;
+        const int ids[3] = { 4, 5, 6 };
+
+        len += snprintf(buf + len, sizeof(buf) - len,
+                        "3 4 0\n3 5 0\n3 6 0\n1 4 0\n1 5 0\n1 6 0\n");
+
+        if (any_lit && fade) {
+            for (i = 0; i < 3 && len < (int)sizeof(buf) - 64; i++) {
+                if (pwms[i] > 0) {
+                    len += snprintf(buf + len, sizeof(buf) - len,
+                                    "16 %d 1 1 1\n6 %d %d\n25 %d %d\n",
+                                    ids[i], ids[i], interval_ms, ids[i], pwms[i]);
+                }
+            }
+            for (i = 0; i < 3 && len < (int)sizeof(buf) - 16; i++) {
+                if (pwms[i] > 0) {
+                    len += snprintf(buf + len, sizeof(buf) - len, "3 %d 1\n", ids[i]);
+                }
+            }
+        } else if (any_lit) {
+            for (i = 0; i < 3 && len < (int)sizeof(buf) - 32; i++) {
+                if (pwms[i] > 0) {
+                    len += snprintf(buf + len, sizeof(buf) - len,
+                                    "4 %d %d\n1 %d 1\n", ids[i], pwms[i], ids[i]);
+                }
+            }
+        }
+
+        if (len > 0) {
+            write(fd, buf, len);
+        }
+        close(fd);
+    }
 }
 
 static int
@@ -288,11 +314,36 @@ set_speaker_light_locked(struct light_device_t* dev,
         write_fih_led(0, red > 0 ? 1 : 0);
         write_fih_led(1, green > 0 ? 1 : 0);
         write_fih_led(2, blue > 0 ? 1 : 0);
-        // Accent bottom chin RGB bar (channels 4,5,6) only for notifications (stay off while charging)
-        if (is_lit(&g_notification)) {
-            write_fih_sub_bar(red, green, blue, 150, (onMS > 0 && offMS > 0) ? 1 : 0);
-        } else {
-            write_fih_sub_bar(0, 0, 0, 0, 0);
+        // Accent bottom chin RGB bar (channels 4,5,6) governed by CMParts properties
+        {
+            char prop_val[PROPERTY_VALUE_MAX];
+            int master_on = 1;
+            int notif_on = 1;
+            int chg_on = 0;
+            int bright = 100;
+            if (property_get("persist.sys.bottom_led_enabled", prop_val, "1") > 0 && prop_val[0] == '0')
+                master_on = 0;
+            if (property_get("persist.sys.bottom_led_notif", prop_val, "1") > 0 && prop_val[0] == '0')
+                notif_on = 0;
+            if (property_get("persist.sys.bottom_led_charging", prop_val, "0") > 0 && prop_val[0] != '0')
+                chg_on = 1;
+            if (property_get("persist.sys.bottom_led_bright", prop_val, "100") > 0) {
+                bright = atoi(prop_val);
+                if (bright < 25) bright = 25;
+                if (bright > 150) bright = 150;
+            }
+            if (master_on && is_lit(&g_notification) && notif_on) {
+                /* Nokia 3710 Fold-style warm yellow-orange breathing glow for unread notifications */
+                int scale_max = (185 * bright) / 100;
+                if (scale_max > 235) scale_max = 235;
+                write_fih_sub_bar(255, 125, 0, scale_max, 1, 52);
+            } else if (master_on && !is_lit(&g_notification) && is_lit(&g_battery) && chg_on && (red > 0 || green > 0 || blue > 0)) {
+                int scale_max = (90 * bright) / 100;
+                if (scale_max > 225) scale_max = 225;
+                write_fih_sub_bar(red, green, blue, scale_max, 0, 32);
+            } else {
+                write_fih_sub_bar(0, 0, 0, 0, 0, 32);
+            }
         }
     } else {
         /* all of related red led is replaced by amber */
