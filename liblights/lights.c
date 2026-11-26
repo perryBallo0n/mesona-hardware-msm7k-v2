@@ -19,6 +19,7 @@
 #define LOG_TAG "lights"
 
 #include <cutils/log.h>
+#include <cutils/properties.h>
 
 #include <stdint.h>
 #include <string.h>
@@ -207,6 +208,45 @@ static void write_fih_led(int id, int val)
     }
 }
 
+static void
+write_fih_sub_led(int id, int pwm, int fade, int on)
+{
+    int fd = open("/sys/class/led/fih_led/control", O_WRONLY);
+    if (fd >= 0) {
+        char buf[96];
+        int len;
+        if (!on || pwm <= 0) {
+            len = snprintf(buf, sizeof(buf), "3 %d 0\n1 %d 0\n", id, id);
+        } else if (fade) {
+            len = snprintf(buf, sizeof(buf), "1 %d 0\n25 %d %d\n6 %d 3\n3 %d 1\n",
+                           id, id, pwm, id, id);
+        } else {
+            len = snprintf(buf, sizeof(buf), "3 %d 0\n4 %d %d\n1 %d 1\n",
+                           id, id, pwm, id);
+        }
+        write(fd, buf, len);
+        close(fd);
+    }
+}
+
+static void
+write_fih_sub_bar(int red, int green, int blue, int scale_max, int fade)
+{
+    char busy[PROPERTY_VALUE_MAX] = {0};
+    property_get("sys.fih_led.busy", busy, "0");
+    if (busy[0] == '1')
+        return;
+    int r_pwm = (red > 0)   ? ((red   * scale_max) / 255) : 0;
+    int g_pwm = (green > 0) ? ((green * scale_max) / 255) : 0;
+    int b_pwm = (blue > 0)  ? ((blue  * scale_max) / 255) : 0;
+    if (red > 0 && r_pwm < 12)   r_pwm = 12;
+    if (green > 0 && g_pwm < 12) g_pwm = 12;
+    if (blue > 0 && b_pwm < 12)  b_pwm = 12;
+    write_fih_sub_led(4, r_pwm, fade && r_pwm > 0, r_pwm > 0);
+    write_fih_sub_led(5, g_pwm, fade && g_pwm > 0, g_pwm > 0);
+    write_fih_sub_led(6, b_pwm, fade && b_pwm > 0, b_pwm > 0);
+}
+
 static int
 set_speaker_light_locked(struct light_device_t* dev,
         struct light_state_t const* state)
@@ -248,6 +288,12 @@ set_speaker_light_locked(struct light_device_t* dev,
         write_fih_led(0, red > 0 ? 1 : 0);
         write_fih_led(1, green > 0 ? 1 : 0);
         write_fih_led(2, blue > 0 ? 1 : 0);
+        // Accent bottom chin RGB bar (channels 4,5,6) only for notifications (stay off while charging)
+        if (is_lit(&g_notification)) {
+            write_fih_sub_bar(red, green, blue, 150, (onMS > 0 && offMS > 0) ? 1 : 0);
+        } else {
+            write_fih_sub_bar(0, 0, 0, 0, 0);
+        }
     } else {
         /* all of related red led is replaced by amber */
         if (red) {
